@@ -4,6 +4,7 @@ defmodule Temperature.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      {Finch, name: Temperature.Finch},
       {Task.Supervisor, name: Temperature.TaskSupervisor},
       Temperature.Server
     ]

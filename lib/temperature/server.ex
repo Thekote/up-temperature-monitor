@@ -1,13 +1,6 @@
 defmodule Temperature.Server do
   use GenServer
 
-  @max_concurrency 3
-  @timeout 15_000
-
-  @max_attempts 3
-  @initial_backoff 500
-  @backoff_factor 2
-
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, city_list(), name: __MODULE__)
   end
@@ -21,69 +14,73 @@ defmodule Temperature.Server do
 
   @impl true
   def handle_call(:fetch, _from, cities) do
+    max_conc = Application.get_env(:temperature, :max_concurrency)
+    timeout = Application.get_env(:temperature, :http_timeout)
+
     results =
       Task.Supervisor.async_stream(
         Temperature.TaskSupervisor,
         cities,
-        &fetch_city_avg/1,
-        max_concurrency: @max_concurrency,
-        timeout: @timeout
+        &fetch_with_retries/1,
+        max_concurrency: max_conc,
+        timeout: timeout
       )
       |> Enum.map(&format_task_result/1)
 
     {:reply, results, cities}
   end
 
-  defp fetch_city_avg(city) do
-    do_fetch(city, @max_attempts, @initial_backoff)
+  defp fetch_with_retries(city) do
+    max_attempts = Application.get_env(:temperature, :max_attempts)
+    base_delay = Application.get_env(:temperature, :backoff_base)
+
+    do_fetch(city, max_attempts, base_delay)
   end
 
-  defp do_fetch(%{name: name}, 0, _delay) do
-    {:error, name, "max retries reached"}
-  end
+  defp do_fetch(%{name: name}, 0, _delay), do: {:error, name, "max retries reached"}
 
   defp do_fetch(
          %{name: name, latitude: lat, longitude: lon, timezone: tz} = city,
          attempts,
          delay
-       ) do
-    if owner = Application.get_env(:temperature, :req_test_owner) do
-      Req.Test.allow(Temperature.Server, owner, self())
-    end
-
+       )
+       when attempts > 0 do
     url = build_url(lat, lon, tz)
-
+    client = Application.get_env(:temperature, :http_client, Temperature.ReqClient)
     opts = Application.get_env(:temperature, :req_options, [])
 
-    case Req.get(url, opts) do
-      {:ok, %{status: 200, body: %{"daily" => %{"temperature_2m_max" => temps}}}} ->
-        parse_temps(temps, name)
+    result =
+      with {:ok, %{status: 200, body: %{"daily" => %{"temperature_2m_max" => temps}}}} <-
+             client.get(url, opts),
+           list when list != [] <- Enum.take(temps, 6) do
+        {:ok, name, Enum.sum(list) / length(list)}
+      else
+        {:ok, %{status: _status}} when attempts > 1 ->
+          retry(city, attempts, delay)
 
-      {:ok, %{status: _status}} when attempts > 1 ->
-        :timer.sleep(delay)
-        do_fetch(city, attempts - 1, delay * @backoff_factor)
+        {:error, _reason} when attempts > 1 ->
+          retry(city, attempts, delay)
 
-      {:error, _} = _err when attempts > 0 ->
-        :timer.sleep(delay)
-        do_fetch(city, attempts - 1, delay * @backoff_factor)
+        {:ok, _bad} ->
+          {:error, name, "bad status"}
 
-      {:ok, %{status: status}} ->
-        {:error, name, "status #{status}"}
+        [] ->
+          {:error, name, "no data"}
 
-      {:error, reason} ->
-        {:error, name, reason}
+        {:error, reason} ->
+          {:error, name, reason}
+      end
+
+    case result do
+      {:ok, city, avg} -> {:ok, city, Float.round(avg, 1)}
+      other -> other
     end
   end
 
-  defp parse_temps(temps, name) do
-    case Enum.take(temps, 6) do
-      [] ->
-        {:error, name, "no data"}
-
-      list ->
-        avg = Enum.sum(list) / length(list)
-        {:ok, name, Float.round(avg, 1)}
-    end
+  defp retry(city, attempts, delay) do
+    :timer.sleep(delay)
+    backoff = Application.get_env(:temperature, :backoff_factor)
+    do_fetch(city, attempts - 1, delay * backoff)
   end
 
   defp format_task_result({:ok, {:ok, city, avg}}), do: "#{city}: #{avg}°C"
